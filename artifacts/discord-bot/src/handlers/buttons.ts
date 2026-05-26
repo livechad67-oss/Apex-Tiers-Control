@@ -85,16 +85,18 @@ export async function handleOpenQueue(
     embeds: [buildControlPanelEmbed(queue)],
   });
 
-  const channel = interaction.channel as TextChannel;
+  const publicChannelId = queue.playerPanelChannelId!;
+  const publicChannel = await interaction.client.channels.fetch(publicChannelId) as TextChannel;
 
-  await channel.send({ content: "@everyone The **" + queueName + "** queue is now **open**! 🟢" });
+  await publicChannel.send({
+    content: `@everyone The **${queueName}** queue is now **open**! 🟢 Tester: **${queue.testerName}**`,
+  });
 
-  const playerMsg = await channel.send({
+  const playerMsg = await publicChannel.send({
     embeds: [buildPlayerInterfaceEmbed(queue)],
     components: [buildPlayerInterfaceButtons(queueName)],
   });
 
-  queue.playerPanelChannelId = channel.id;
   queue.playerPanelMessageId = playerMsg.id;
   setQueue(queueName, queue);
 }
@@ -186,11 +188,11 @@ export async function handlePullPlayer(
 
   await updatePlayerPanel(interaction, queueName);
 
-  const channel = interaction.channel as TextChannel;
+  const publicChannel = await interaction.client.channels.fetch(queue.playerPanelChannelId!) as TextChannel;
 
   try {
     const threadName = `test-${player.username}`.slice(0, 100);
-    const thread = await channel.threads.create({
+    const thread = await publicChannel.threads.create({
       name: threadName,
       autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
       type: ChannelType.PrivateThread,
@@ -241,10 +243,13 @@ export async function handlePingQueue(
 
   const mentions = queue.players.map((p) => `<@${p.id}>`).join(" ");
 
-  await interaction.reply({
+  const publicChannel = await interaction.client.channels.fetch(queue.playerPanelChannelId!) as TextChannel;
+  await publicChannel.send({
     content: `🔔 Attention queue members for **${queueName}**: ${mentions}\nYour tester **${queue.testerName}** is still active — get ready!`,
     allowedMentions: { users: queue.players.map((p) => p.id) },
   });
+
+  await interaction.reply({ content: "✅ Pinged all players in the queue.", ephemeral: true });
 }
 
 export async function handleJoinQueue(
