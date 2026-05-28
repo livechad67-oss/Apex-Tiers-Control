@@ -24,12 +24,12 @@ args = "Apex Tiers Discord Bot"
 name = "Apex Tiers Discord Bot"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "console"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "pnpm --filter @workspace/discord-bot run build && pnpm --filter @workspace/discord-bot run start"
-
-[workflows.workflow.metadata]
-outputType = "console"
 
 [agent]
 stack = "PNPM_WORKSPACE"
