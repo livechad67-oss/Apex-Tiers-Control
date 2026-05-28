@@ -12,16 +12,16 @@
     "push-force": "drizzle-kit push --force --config ./drizzle.config.ts"
   },
   "dependencies": {
-    "drizzle-orm": "catalog:",
-    "drizzle-zod": "^0.0.0",
+    "drizzle-orm": "^0.30.10",
+    "drizzle-zod": "^0.5.1",
     "express": "^4.19.2",
-    "pg": "^8.11.0",
-    "zod": "catalog:"
+    "pg": "^8.11.5",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/node": "catalog:",
-    "@types/pg": "^8.11.0",
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.5",
     "@types/express": "^4.17.21",
-    "drizzle-kit": "^0.21.0"
+    "drizzle-kit": "^0.21.4"
   }
 }
