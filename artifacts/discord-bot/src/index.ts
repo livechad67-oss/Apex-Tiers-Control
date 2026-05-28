@@ -1,14 +1,3 @@
-import express from 'express';
-const app = express();
-const PORT = process.env.PORT || 8080;
-
-app.get('/', (req, res) => {
-  res.send('Bot is awake!');
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Web server running on port ${PORT}`);
-});
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -21,10 +10,14 @@ import {
   GatewayIntentBits,
   GuildMember,
   Interaction,
+  ModalBuilder,
+  ModalSubmitInteraction,
   REST,
   Routes,
   SlashCommandBuilder,
   TextChannel,
+  TextInputBuilder,
+  TextInputStyle,
   ThreadAutoArchiveDuration,
 } from "discord.js";
 
@@ -49,6 +42,10 @@ interface QueuePlayer {
   id: string;
   username: string;
   displayName: string;
+  mcUsername: string;
+  region: string;
+  preferredServer: string;
+  tier: string;
 }
 
 interface QueueState {
@@ -59,8 +56,12 @@ interface QueueState {
   players: QueuePlayer[];
   controlPanelChannelId: string;
   controlPanelMessageId: string;
+  // The PUBLIC channel where the player interface lives — never wiped, set once at /setupcontrol
   playerPanelChannelId: string | null;
+  // The current player interface message — nulled when queue closes, set when it opens
   playerPanelMessageId: string | null;
+  // The @everyone ping message — deleted when queue closes
+  pingMessageId: string | null;
 }
 
 const queues = new Map<string, QueueState>();
@@ -89,6 +90,7 @@ function createQueue(
     controlPanelMessageId,
     playerPanelChannelId,
     playerPanelMessageId: null,
+    pingMessageId: null,
   };
   queues.set(name, state);
   return state;
@@ -160,10 +162,16 @@ function buildControlPanelButtons(queueName: string): ActionRowBuilder<ButtonBui
 
 function buildPlayerInterfaceEmbed(queue: QueueState): EmbedBuilder {
   const isOpen = queue.status === "open";
-  const playerList =
-    queue.players.length > 0
-      ? queue.players.map((p, i) => `**#${i + 1}** ${p.displayName}`).join("\n")
-      : "No players in queue.";
+
+  let playerList = "No players in queue.";
+  if (queue.players.length > 0) {
+    playerList = queue.players
+      .map((p, i) =>
+        `**#${i + 1} ${p.displayName}**\n` +
+        `⚔️ MC: \`${p.mcUsername}\` · 🌍 ${p.region} · 🖥️ ${p.preferredServer} · 📊 ${p.tier}`
+      )
+      .join("\n\n");
+  }
 
   return new EmbedBuilder()
     .setTitle(`🎮 ${queue.name}`)
@@ -198,6 +206,51 @@ function buildOfflineEmbed(queueName: string): EmbedBuilder {
     .setTimestamp();
 }
 
+function buildJoinModal(queueName: string): ModalBuilder {
+  const id = encodeQueueId(queueName);
+  return new ModalBuilder()
+    .setCustomId(`join_modal::${id}`)
+    .setTitle("Join Queue — Player Info")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("mc_username")
+          .setLabel("Minecraft Username")
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder("e.g. Steve")
+          .setRequired(true)
+          .setMaxLength(32)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("region")
+          .setLabel("Region")
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder("e.g. NA, EU, AS, OCE")
+          .setRequired(true)
+          .setMaxLength(20)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("preferred_server")
+          .setLabel("Preferred Server")
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder("e.g. Hypixel, Minemen, PotPvP")
+          .setRequired(true)
+          .setMaxLength(50)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("tier")
+          .setLabel("Current Tier")
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder("e.g. HT1, HT2, LT1, LT2, Unranked")
+          .setRequired(true)
+          .setMaxLength(20)
+      )
+    );
+}
+
 // ============================================================
 // PERMISSION CHECK
 // ============================================================
@@ -209,14 +262,14 @@ function isStaffMember(member: GuildMember | null): boolean {
 }
 
 // ============================================================
-// HELPERS — update remote messages
+// HELPERS — refresh remote messages (client-based, usable from any context)
 // ============================================================
 
-async function updatePlayerPanel(interaction: ButtonInteraction, queueName: string): Promise<void> {
+async function refreshPlayerPanel(client: Client, queueName: string): Promise<void> {
   const queue = getQueue(queueName);
-  if (!queue || !queue.playerPanelMessageId || !queue.playerPanelChannelId) return;
+  if (!queue?.playerPanelMessageId || !queue?.playerPanelChannelId) return;
   try {
-    const channel = await interaction.client.channels.fetch(queue.playerPanelChannelId);
+    const channel = await client.channels.fetch(queue.playerPanelChannelId);
     if (!channel || !(channel instanceof TextChannel)) return;
     const msg = await channel.messages.fetch(queue.playerPanelMessageId);
     await msg.edit({
@@ -226,11 +279,11 @@ async function updatePlayerPanel(interaction: ButtonInteraction, queueName: stri
   } catch { }
 }
 
-async function updateControlPanel(interaction: ButtonInteraction, queueName: string): Promise<void> {
+async function refreshControlPanel(client: Client, queueName: string): Promise<void> {
   const queue = getQueue(queueName);
-  if (!queue || !queue.controlPanelMessageId || !queue.controlPanelChannelId) return;
+  if (!queue?.controlPanelMessageId || !queue?.controlPanelChannelId) return;
   try {
-    const channel = await interaction.client.channels.fetch(queue.controlPanelChannelId);
+    const channel = await client.channels.fetch(queue.controlPanelChannelId);
     if (!channel || !(channel instanceof TextChannel)) return;
     const msg = await channel.messages.fetch(queue.controlPanelMessageId);
     await msg.edit({ embeds: [buildControlPanelEmbed(queue)] });
@@ -300,28 +353,52 @@ async function handleOpenQueue(interaction: ButtonInteraction, encodedName: stri
   const queue = getQueue(queueName);
   if (!queue) { await interaction.reply({ content: "Queue not found.", ephemeral: true }); return; }
   if (queue.status === "open") { await interaction.reply({ content: "Queue is already open.", ephemeral: true }); return; }
+  if (!queue.playerPanelChannelId) { await interaction.reply({ content: "No player channel configured. Please run `/setupcontrol` again.", ephemeral: true }); return; }
 
   const member = interaction.member as GuildMember;
   queue.status = "open";
   queue.testerId = interaction.user.id;
   queue.testerName = member.displayName;
   queue.players = [];
+  queue.playerPanelMessageId = null;
+  queue.pingMessageId = null;
   setQueue(queueName, queue);
 
   await interaction.update({ embeds: [buildControlPanelEmbed(queue)] });
 
-  const publicChannel = await interaction.client.channels.fetch(queue.playerPanelChannelId!) as TextChannel;
+  const publicChannel = await interaction.client.channels.fetch(queue.playerPanelChannelId) as TextChannel;
 
-  await publicChannel.send({
+  // Send @everyone ping and store the message ID so we can delete it on close
+  const pingMsg = await publicChannel.send({
     content: `@everyone The **${queueName}** queue is now **open**! 🟢 Tester: **${queue.testerName}**`,
   });
+  queue.pingMessageId = pingMsg.id;
 
-  const playerMsg = await publicChannel.send({
-    embeds: [buildPlayerInterfaceEmbed(queue)],
-    components: [buildPlayerInterfaceButtons(queueName)],
-  });
+  // Edit the existing player interface message if it exists, otherwise post a new one
+  // This prevents a new "offline" message piling up every time the queue cycles
+  if (queue.playerPanelMessageId) {
+    try {
+      const existing = await publicChannel.messages.fetch(queue.playerPanelMessageId);
+      await existing.edit({
+        embeds: [buildPlayerInterfaceEmbed(queue)],
+        components: [buildPlayerInterfaceButtons(queueName)],
+      });
+    } catch {
+      // Message was deleted externally — send a fresh one
+      const playerMsg = await publicChannel.send({
+        embeds: [buildPlayerInterfaceEmbed(queue)],
+        components: [buildPlayerInterfaceButtons(queueName)],
+      });
+      queue.playerPanelMessageId = playerMsg.id;
+    }
+  } else {
+    const playerMsg = await publicChannel.send({
+      embeds: [buildPlayerInterfaceEmbed(queue)],
+      components: [buildPlayerInterfaceButtons(queueName)],
+    });
+    queue.playerPanelMessageId = playerMsg.id;
+  }
 
-  queue.playerPanelMessageId = playerMsg.id;
   setQueue(queueName, queue);
 }
 
@@ -336,25 +413,40 @@ async function handleCloseQueue(interaction: ButtonInteraction, encodedName: str
   const queue = getQueue(queueName);
   if (!queue) { await interaction.reply({ content: "Queue not found.", ephemeral: true }); return; }
 
-  const prevPlayerChannelId = queue.playerPanelChannelId;
+  // Snapshot IDs we need to clean up BEFORE wiping state
+  const prevPlayerChannelId = queue.playerPanelChannelId; // Keep the channel reference — needed to re-open later
   const prevPlayerMessageId = queue.playerPanelMessageId;
+  const prevPingMessageId = queue.pingMessageId;
 
   queue.status = "closed";
   queue.testerId = "";
   queue.testerName = "";
   queue.players = [];
-  queue.playerPanelMessageId = null;
-  queue.playerPanelChannelId = null;
+  queue.pingMessageId = null;
+  // NOTE: playerPanelChannelId and playerPanelMessageId are intentionally NOT wiped —
+  // they persist so re-open edits the existing message instead of posting a new one
   setQueue(queueName, queue);
 
   await interaction.update({ embeds: [buildControlPanelEmbed(queue)] });
 
-  if (prevPlayerMessageId && prevPlayerChannelId) {
+  if (prevPlayerChannelId) {
     try {
-      const ch = await interaction.client.channels.fetch(prevPlayerChannelId);
-      if (ch instanceof TextChannel) {
-        const msg = await ch.messages.fetch(prevPlayerMessageId);
-        await msg.edit({ embeds: [buildOfflineEmbed(queueName)], components: [] });
+      const ch = await interaction.client.channels.fetch(prevPlayerChannelId) as TextChannel;
+
+      // Delete the @everyone ping message
+      if (prevPingMessageId) {
+        try {
+          const pingMsg = await ch.messages.fetch(prevPingMessageId);
+          await pingMsg.delete();
+        } catch { }
+      }
+
+      // Update the player interface to "offline"
+      if (prevPlayerMessageId) {
+        try {
+          const playerMsg = await ch.messages.fetch(prevPlayerMessageId);
+          await playerMsg.edit({ embeds: [buildOfflineEmbed(queueName)], components: [] });
+        } catch { }
       }
     } catch { }
   }
@@ -377,7 +469,7 @@ async function handlePullPlayer(interaction: ButtonInteraction, encodedName: str
 
   setQueue(queueName, queue);
   await interaction.update({ embeds: [buildControlPanelEmbed(queue)] });
-  await updatePlayerPanel(interaction, queueName);
+  await refreshPlayerPanel(interaction.client, queueName);
 
   const publicChannel = await interaction.client.channels.fetch(queue.playerPanelChannelId!) as TextChannel;
 
@@ -390,10 +482,25 @@ async function handlePullPlayer(interaction: ButtonInteraction, encodedName: str
     });
     await thread.members.add(queue.testerId);
     await thread.members.add(player.id);
+
+    const closeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("close_thread")
+        .setLabel("Close Thread")
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji("🔒")
+    );
+
     await thread.send({
       content:
         `Hey <@${player.id}>! You've been pulled from the **${queueName}** queue.\n` +
-        `Your tester is <@${queue.testerId}>. Get ready! ⚔️`,
+        `Your tester is <@${queue.testerId}>. Get ready! ⚔️\n\n` +
+        `📋 **Player Info:**\n` +
+        `⚔️ MC Username: \`${player.mcUsername}\`\n` +
+        `🌍 Region: ${player.region}\n` +
+        `🖥️ Preferred Server: ${player.preferredServer}\n` +
+        `📊 Tier: ${player.tier}`,
+      components: [closeRow],
     });
   } catch (err) {
     console.error("Failed to create private thread:", err);
@@ -427,28 +534,19 @@ async function handlePingQueue(interaction: ButtonInteraction, encodedName: stri
   await interaction.reply({ content: "✅ Pinged all players in the queue.", ephemeral: true });
 }
 
+// Shows the modal — the actual joining happens in handleJoinQueueModal
 async function handleJoinQueue(interaction: ButtonInteraction, encodedName: string): Promise<void> {
   const queueName = decodeQueueId(encodedName);
   const queue = getQueue(queueName);
 
   if (!queue) { await interaction.reply({ content: "Queue not found.", ephemeral: true }); return; }
   if (queue.status !== "open") { await interaction.reply({ content: "This queue is currently closed.", ephemeral: true }); return; }
+  if (queue.players.some((p) => p.id === interaction.user.id)) {
+    await interaction.reply({ content: "You're already in the queue!", ephemeral: true });
+    return;
+  }
 
-  const member = interaction.member as GuildMember;
-  const added = addPlayer(queueName, {
-    id: interaction.user.id,
-    username: interaction.user.username,
-    displayName: member.displayName,
-  });
-
-  if (!added) { await interaction.reply({ content: "You're already in the queue!", ephemeral: true }); return; }
-
-  await interaction.update({
-    embeds: [buildPlayerInterfaceEmbed(queue)],
-    components: [buildPlayerInterfaceButtons(queueName)],
-  });
-
-  await updateControlPanel(interaction, queueName);
+  await interaction.showModal(buildJoinModal(queueName));
 }
 
 async function handleLeaveQueue(interaction: ButtonInteraction, encodedName: string): Promise<void> {
@@ -465,7 +563,68 @@ async function handleLeaveQueue(interaction: ButtonInteraction, encodedName: str
     components: [buildPlayerInterfaceButtons(queueName)],
   });
 
-  await updateControlPanel(interaction, queueName);
+  await refreshControlPanel(interaction.client, queueName);
+}
+
+async function handleCloseThread(interaction: ButtonInteraction): Promise<void> {
+  if (!isStaffMember(interaction.member as GuildMember)) {
+    await interaction.reply({ content: "Only **Verified Testers** can close threads.", ephemeral: true });
+    return;
+  }
+
+  const thread = interaction.channel;
+  if (!thread || !thread.isThread()) {
+    await interaction.reply({ content: "This button can only be used inside a thread.", ephemeral: true });
+    return;
+  }
+
+  await interaction.reply({ content: "🔒 Test session complete. Thread closed." });
+  await thread.setArchived(true);
+}
+
+// ============================================================
+// MODAL SUBMIT HANDLER — Join Queue form
+// ============================================================
+
+async function handleJoinQueueModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const encodedName = interaction.customId.split("::")[1];
+  if (!encodedName) { await interaction.reply({ content: "Something went wrong.", ephemeral: true }); return; }
+
+  const queueName = decodeQueueId(encodedName);
+  const queue = getQueue(queueName);
+
+  if (!queue) { await interaction.reply({ content: "Queue not found.", ephemeral: true }); return; }
+  if (queue.status !== "open") { await interaction.reply({ content: "The queue closed while you were filling in the form.", ephemeral: true }); return; }
+
+  const mcUsername = interaction.fields.getTextInputValue("mc_username").trim();
+  const region = interaction.fields.getTextInputValue("region").trim();
+  const preferredServer = interaction.fields.getTextInputValue("preferred_server").trim();
+  const tier = interaction.fields.getTextInputValue("tier").trim();
+
+  const member = interaction.member as GuildMember;
+  const added = addPlayer(queueName, {
+    id: interaction.user.id,
+    username: interaction.user.username,
+    displayName: member.displayName,
+    mcUsername,
+    region,
+    preferredServer,
+    tier,
+  });
+
+  if (!added) {
+    await interaction.reply({ content: "You're already in the queue!", ephemeral: true });
+    return;
+  }
+
+  await interaction.reply({
+    content: `✅ You've joined the **${queueName}** queue!\n📋 **Your info:** MC: \`${mcUsername}\` · ${region} · ${preferredServer} · ${tier}`,
+    ephemeral: true,
+  });
+
+  // Update both panels from the client since modal submits can't call .update()
+  await refreshPlayerPanel(interaction.client, queueName);
+  await refreshControlPanel(interaction.client, queueName);
 }
 
 // ============================================================
@@ -518,6 +677,7 @@ client.once("ready", async (readyClient) => {
 });
 
 client.on("interactionCreate", async (interaction: Interaction) => {
+  // ── Slash commands ──────────────────────────────────────────
   if (interaction.isChatInputCommand()) {
     try {
       if (interaction.commandName === "setupcontrol") {
@@ -532,18 +692,36 @@ client.on("interactionCreate", async (interaction: Interaction) => {
         await interaction.reply(msg).catch(console.error);
       }
     }
+
+  // ── Modal submits ───────────────────────────────────────────
+  } else if (interaction.isModalSubmit()) {
+    try {
+      if (interaction.customId.startsWith("join_modal::")) {
+        await handleJoinQueueModal(interaction);
+      }
+    } catch (err) {
+      console.error("Error handling modal:", err);
+      const msg = { content: "An error occurred while processing your submission.", ephemeral: true };
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(msg).catch(console.error);
+      } else {
+        await interaction.reply(msg).catch(console.error);
+      }
+    }
+
+  // ── Button clicks ───────────────────────────────────────────
   } else if (interaction.isButton()) {
     const [action, encodedName] = interaction.customId.split("::");
-    if (!action || !encodedName) return;
 
     try {
       switch (action) {
-        case "open_queue":   await handleOpenQueue(interaction, encodedName); break;
-        case "close_queue":  await handleCloseQueue(interaction, encodedName); break;
-        case "pull_player":  await handlePullPlayer(interaction, encodedName); break;
-        case "ping_queue":   await handlePingQueue(interaction, encodedName); break;
-        case "join_queue":   await handleJoinQueue(interaction, encodedName); break;
-        case "leave_queue":  await handleLeaveQueue(interaction, encodedName); break;
+        case "open_queue":   await handleOpenQueue(interaction, encodedName!); break;
+        case "close_queue":  await handleCloseQueue(interaction, encodedName!); break;
+        case "pull_player":  await handlePullPlayer(interaction, encodedName!); break;
+        case "ping_queue":   await handlePingQueue(interaction, encodedName!); break;
+        case "join_queue":   await handleJoinQueue(interaction, encodedName!); break;
+        case "leave_queue":  await handleLeaveQueue(interaction, encodedName!); break;
+        case "close_thread": await handleCloseThread(interaction); break;
       }
     } catch (err) {
       console.error(`Error handling button [${interaction.customId}]:`, err);
