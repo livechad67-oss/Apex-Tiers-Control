@@ -4,16 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --enable-source-maps ./dist/index.mjs",
     "build": "node ./build.mjs",
-    "start": "node --enable-source-maps ./dist/index.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "start": "node ./dist/index.js"
   },
   "dependencies": {
-    "discord.js": "^14.18.0"
+    "@workspace/db": "workspace:*",
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
   },
   "devDependencies": {
-    "@types/node": "catalog:",
-    "esbuild": "0.27.3"
+    "@types/node": "^20.11.0",
+    "@types/express": "^4.17.21",
+    "esbuild": "^0.21.4",
+    "typescript": "^5.4.5"
   }
 }
