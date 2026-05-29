@@ -1,3 +1,8 @@
+import http from 'http';
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is awake!');
+}).listen(process.env.PORT || 8080, '0.0.0.0');
 import {
   ActionRowBuilder,
   ButtonBuilder,
