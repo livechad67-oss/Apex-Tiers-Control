@@ -1,8 +1,3 @@
-import http from 'http';
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Bot is awake!');
-}).listen(process.env.PORT || 8080, '0.0.0.0');
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -17,13 +12,14 @@ import {
   Interaction,
   ModalBuilder,
   ModalSubmitInteraction,
+  OverwriteType,
+  PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
   TextChannel,
   TextInputBuilder,
   TextInputStyle,
-  ThreadAutoArchiveDuration,
 } from "discord.js";
 
 // ============================================================
@@ -33,6 +29,7 @@ import {
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const VERIFIED_TESTER_ROLE_NAME = "Verified Tester";
+const RESULTS_CHANNEL_NAME = "results";
 
 if (!TOKEN) {
   console.error("DISCORD_TOKEN environment variable is required.");
@@ -50,7 +47,7 @@ interface QueuePlayer {
   mcUsername: string;
   region: string;
   preferredServer: string;
-  tier: string;
+  tier: string; // previous tier submitted by player
 }
 
 interface QueueState {
@@ -61,15 +58,28 @@ interface QueueState {
   players: QueuePlayer[];
   controlPanelChannelId: string;
   controlPanelMessageId: string;
-  // The PUBLIC channel where the player interface lives — never wiped, set once at /setupcontrol
+  // PUBLIC channel — set once at /setupcontrol, never wiped
   playerPanelChannelId: string | null;
-  // The current player interface message — nulled when queue closes, set when it opens
+  // The CURRENT player interface message (open embed or offline embed)
+  // Deleted and re-posted every open/close cycle so there's always exactly one message
   playerPanelMessageId: string | null;
-  // The @everyone ping message — deleted when queue closes
+  // The @everyone ping — deleted when queue closes
   pingMessageId: string | null;
 }
 
+interface TicketData {
+  playerId: string;
+  playerMcUsername: string;
+  playerRegion: string;
+  playerPreferredServer: string;
+  playerPreviousTier: string;
+  testerId: string;
+  testerName: string;
+  queueName: string;
+}
+
 const queues = new Map<string, QueueState>();
+const tickets = new Map<string, TicketData>(); // key = ticket channelId
 
 function getQueue(name: string): QueueState | undefined {
   return queues.get(name);
@@ -132,6 +142,8 @@ const OPEN_COLOR = 0x2ecc71;
 const CLOSED_COLOR = 0xe74c3c;
 const PLAYER_COLOR = 0x3498db;
 const OFFLINE_COLOR = 0x95a5a6;
+const TICKET_COLOR = 0x9b59b6;
+const RESULTS_COLOR = 0xf39c12;
 
 function encodeQueueId(name: string): string {
   return name.replace(/:/g, "\u2236");
@@ -166,28 +178,20 @@ function buildControlPanelButtons(queueName: string): ActionRowBuilder<ButtonBui
 }
 
 function buildPlayerInterfaceEmbed(queue: QueueState): EmbedBuilder {
-  const isOpen = queue.status === "open";
-
   let playerList = "No players in queue.";
   if (queue.players.length > 0) {
+    // Show ONLY the mention — no private details visible in public channel
     playerList = queue.players
-      .map((p, i) =>
-        `**#${i + 1} ${p.displayName}**\n` +
-        `⚔️ MC: \`${p.mcUsername}\` · 🌍 ${p.region} · 🖥️ ${p.preferredServer} · 📊 ${p.tier}`
-      )
-      .join("\n\n");
+      .map((p, i) => `**#${i + 1}** <@${p.id}>`)
+      .join("\n");
   }
 
   return new EmbedBuilder()
     .setTitle(`🎮 ${queue.name}`)
-    .setColor(isOpen ? PLAYER_COLOR : OFFLINE_COLOR)
-    .setDescription(
-      isOpen
-        ? `**Active Tester:** ${queue.testerName}\n\n**Queue:**\n${playerList}`
-        : "No testers are online right now."
-    )
+    .setColor(PLAYER_COLOR)
+    .setDescription(`**Active Tester:** ${queue.testerName}\n\n**Queue:**\n${playerList}`)
     .addFields(
-      { name: "Status", value: isOpen ? "🟢 Open" : "🔴 Closed", inline: true },
+      { name: "Status", value: "🟢 Open", inline: true },
       { name: "Waiting", value: String(queue.players.length), inline: true }
     )
     .setFooter({ text: "Apex Tiers • Join the queue below" })
@@ -247,13 +251,67 @@ function buildJoinModal(queueName: string): ModalBuilder {
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
           .setCustomId("tier")
-          .setLabel("Current Tier")
+          .setLabel("Current Tier (your rank before this test)")
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder("e.g. HT1, HT2, LT1, LT2, Unranked")
+          .setPlaceholder("e.g. HT1, HT2, LT1, Unranked")
           .setRequired(true)
           .setMaxLength(20)
       )
     );
+}
+
+function buildGiveResultModal(): ModalBuilder {
+  return new ModalBuilder()
+    .setCustomId("give_result_modal")
+    .setTitle("Give Result")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("earned_tier")
+          .setLabel("Rank Earned (e.g. Crystal HT4, Sword LT2)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(50)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("gamemode")
+          .setLabel("Gamemode (e.g. Sword, Crystal, SMP)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(50)
+      )
+    );
+}
+
+function buildTicketButtons(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("give_result")
+      .setLabel("Give Result")
+      .setStyle(ButtonStyle.Success)
+      .setEmoji("🏆"),
+    new ButtonBuilder()
+      .setCustomId("close_ticket")
+      .setLabel("Close Ticket")
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji("🔒")
+  );
+}
+
+function buildResultsEmbed(data: TicketData, earnedTier: string, gamemode: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle(`${data.playerMcUsername}'s Test Results 🏆`)
+    .setColor(RESULTS_COLOR)
+    .addFields(
+      { name: "Tester:", value: `<@${data.testerId}>`, inline: false },
+      { name: "Region:", value: data.playerRegion, inline: false },
+      { name: "Gamemode:", value: gamemode, inline: false },
+      { name: "Username:", value: data.playerMcUsername, inline: false },
+      { name: "Previous Rank:", value: data.playerPreviousTier, inline: false },
+      { name: "Rank Earned:", value: earnedTier, inline: false }
+    )
+    .setTimestamp();
 }
 
 // ============================================================
@@ -267,7 +325,7 @@ function isStaffMember(member: GuildMember | null): boolean {
 }
 
 // ============================================================
-// HELPERS — refresh remote messages (client-based, usable from any context)
+// HELPERS — refresh remote messages
 // ============================================================
 
 async function refreshPlayerPanel(client: Client, queueName: string): Promise<void> {
@@ -279,7 +337,7 @@ async function refreshPlayerPanel(client: Client, queueName: string): Promise<vo
     const msg = await channel.messages.fetch(queue.playerPanelMessageId);
     await msg.edit({
       embeds: [buildPlayerInterfaceEmbed(queue)],
-      components: queue.status === "open" ? [buildPlayerInterfaceButtons(queue.name)] : [],
+      components: [buildPlayerInterfaceButtons(queue.name)],
     });
   } catch { }
 }
@@ -292,6 +350,15 @@ async function refreshControlPanel(client: Client, queueName: string): Promise<v
     if (!channel || !(channel instanceof TextChannel)) return;
     const msg = await channel.messages.fetch(queue.controlPanelMessageId);
     await msg.edit({ embeds: [buildControlPanelEmbed(queue)] });
+  } catch { }
+}
+
+// Delete a message safely (ignores errors if already deleted)
+async function tryDeleteMessage(channel: TextChannel, messageId: string | null): Promise<void> {
+  if (!messageId) return;
+  try {
+    const msg = await channel.messages.fetch(messageId);
+    await msg.delete();
   } catch { }
 }
 
@@ -365,44 +432,27 @@ async function handleOpenQueue(interaction: ButtonInteraction, encodedName: stri
   queue.testerId = interaction.user.id;
   queue.testerName = member.displayName;
   queue.players = [];
-  queue.playerPanelMessageId = null;
-  queue.pingMessageId = null;
-  setQueue(queueName, queue);
 
   await interaction.update({ embeds: [buildControlPanelEmbed(queue)] });
 
   const publicChannel = await interaction.client.channels.fetch(queue.playerPanelChannelId) as TextChannel;
 
-  // Send @everyone ping and store the message ID so we can delete it on close
+  // Delete the old offline embed (from previous close) — ensures only one message exists
+  await tryDeleteMessage(publicChannel, queue.playerPanelMessageId);
+  queue.playerPanelMessageId = null;
+
+  // Send @everyone ping
   const pingMsg = await publicChannel.send({
     content: `@everyone The **${queueName}** queue is now **open**! 🟢 Tester: **${queue.testerName}**`,
   });
   queue.pingMessageId = pingMsg.id;
 
-  // Edit the existing player interface message if it exists, otherwise post a new one
-  // This prevents a new "offline" message piling up every time the queue cycles
-  if (queue.playerPanelMessageId) {
-    try {
-      const existing = await publicChannel.messages.fetch(queue.playerPanelMessageId);
-      await existing.edit({
-        embeds: [buildPlayerInterfaceEmbed(queue)],
-        components: [buildPlayerInterfaceButtons(queueName)],
-      });
-    } catch {
-      // Message was deleted externally — send a fresh one
-      const playerMsg = await publicChannel.send({
-        embeds: [buildPlayerInterfaceEmbed(queue)],
-        components: [buildPlayerInterfaceButtons(queueName)],
-      });
-      queue.playerPanelMessageId = playerMsg.id;
-    }
-  } else {
-    const playerMsg = await publicChannel.send({
-      embeds: [buildPlayerInterfaceEmbed(queue)],
-      components: [buildPlayerInterfaceButtons(queueName)],
-    });
-    queue.playerPanelMessageId = playerMsg.id;
-  }
+  // Post fresh open embed
+  const playerMsg = await publicChannel.send({
+    embeds: [buildPlayerInterfaceEmbed(queue)],
+    components: [buildPlayerInterfaceButtons(queueName)],
+  });
+  queue.playerPanelMessageId = playerMsg.id;
 
   setQueue(queueName, queue);
 }
@@ -418,8 +468,7 @@ async function handleCloseQueue(interaction: ButtonInteraction, encodedName: str
   const queue = getQueue(queueName);
   if (!queue) { await interaction.reply({ content: "Queue not found.", ephemeral: true }); return; }
 
-  // Snapshot IDs we need to clean up BEFORE wiping state
-  const prevPlayerChannelId = queue.playerPanelChannelId; // Keep the channel reference — needed to re-open later
+  const prevPlayerChannelId = queue.playerPanelChannelId;
   const prevPlayerMessageId = queue.playerPanelMessageId;
   const prevPingMessageId = queue.pingMessageId;
 
@@ -427,10 +476,8 @@ async function handleCloseQueue(interaction: ButtonInteraction, encodedName: str
   queue.testerId = "";
   queue.testerName = "";
   queue.players = [];
+  queue.playerPanelMessageId = null;
   queue.pingMessageId = null;
-  // NOTE: playerPanelChannelId and playerPanelMessageId are intentionally NOT wiped —
-  // they persist so re-open edits the existing message instead of posting a new one
-  setQueue(queueName, queue);
 
   await interaction.update({ embeds: [buildControlPanelEmbed(queue)] });
 
@@ -438,23 +485,20 @@ async function handleCloseQueue(interaction: ButtonInteraction, encodedName: str
     try {
       const ch = await interaction.client.channels.fetch(prevPlayerChannelId) as TextChannel;
 
-      // Delete the @everyone ping message
-      if (prevPingMessageId) {
-        try {
-          const pingMsg = await ch.messages.fetch(prevPingMessageId);
-          await pingMsg.delete();
-        } catch { }
-      }
+      // Delete the @everyone ping
+      await tryDeleteMessage(ch, prevPingMessageId);
 
-      // Update the player interface to "offline"
-      if (prevPlayerMessageId) {
-        try {
-          const playerMsg = await ch.messages.fetch(prevPlayerMessageId);
-          await playerMsg.edit({ embeds: [buildOfflineEmbed(queueName)], components: [] });
-        } catch { }
-      }
+      // Delete the open embed — replace with fresh offline embed
+      await tryDeleteMessage(ch, prevPlayerMessageId);
+
+      const offlineMsg = await ch.send({
+        embeds: [buildOfflineEmbed(queueName)],
+      });
+      queue.playerPanelMessageId = offlineMsg.id;
     } catch { }
   }
+
+  setQueue(queueName, queue);
 }
 
 async function handlePullPlayer(interaction: ButtonInteraction, encodedName: string): Promise<void> {
@@ -472,45 +516,90 @@ async function handlePullPlayer(interaction: ButtonInteraction, encodedName: str
   const player = pullFirstPlayer(queueName);
   if (!player) { await interaction.reply({ content: "No players in the queue.", ephemeral: true }); return; }
 
+  const guild = interaction.guild;
+  if (!guild) { await interaction.reply({ content: "Could not resolve guild.", ephemeral: true }); return; }
+
   setQueue(queueName, queue);
   await interaction.update({ embeds: [buildControlPanelEmbed(queue)] });
   await refreshPlayerPanel(interaction.client, queueName);
 
-  const publicChannel = await interaction.client.channels.fetch(queue.playerPanelChannelId!) as TextChannel;
-
   try {
-    const thread = await publicChannel.threads.create({
-      name: `test-${player.username}`.slice(0, 100),
-      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-      type: ChannelType.PrivateThread,
-      reason: `Apex Tiers test session for ${player.username}`,
+    // Create a private ticket channel — only the player, tester, and bot can see it
+    const ticketChannel = await guild.channels.create({
+      name: `test-${player.mcUsername.toLowerCase().replace(/[^a-z0-9-]/g, "")}`,
+      type: ChannelType.GuildText,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          type: OverwriteType.Role,
+          deny: [PermissionFlagsBits.ViewChannel],
+        },
+        {
+          id: player.id,
+          type: OverwriteType.Member,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+          ],
+        },
+        {
+          id: queue.testerId,
+          type: OverwriteType.Member,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+          ],
+        },
+        {
+          id: interaction.client.user!.id,
+          type: OverwriteType.Member,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.ManageChannels,
+          ],
+        },
+      ],
     });
-    await thread.members.add(queue.testerId);
-    await thread.members.add(player.id);
 
-    const closeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("close_thread")
-        .setLabel("Close Thread")
-        .setStyle(ButtonStyle.Danger)
-        .setEmoji("🔒")
-    );
+    // Store ticket data so we can reference it on Give Result / Close Ticket
+    tickets.set(ticketChannel.id, {
+      playerId: player.id,
+      playerMcUsername: player.mcUsername,
+      playerRegion: player.region,
+      playerPreferredServer: player.preferredServer,
+      playerPreviousTier: player.tier,
+      testerId: queue.testerId,
+      testerName: queue.testerName,
+      queueName,
+    });
 
-    await thread.send({
-      content:
-        `Hey <@${player.id}>! You've been pulled from the **${queueName}** queue.\n` +
-        `Your tester is <@${queue.testerId}>. Get ready! ⚔️\n\n` +
-        `📋 **Player Info:**\n` +
-        `⚔️ MC Username: \`${player.mcUsername}\`\n` +
-        `🌍 Region: ${player.region}\n` +
-        `🖥️ Preferred Server: ${player.preferredServer}\n` +
-        `📊 Tier: ${player.tier}`,
-      components: [closeRow],
+    // Player info embed (private — visible only inside the ticket channel)
+    const infoEmbed = new EmbedBuilder()
+      .setTitle(`🎫 Test Session — ${player.mcUsername}`)
+      .setColor(TICKET_COLOR)
+      .setDescription(`Hey <@${player.id}>! You've been pulled from the **${queueName}** queue.\nYour tester is <@${queue.testerId}> — get ready! ⚔️`)
+      .addFields(
+        { name: "⚔️ MC Username", value: player.mcUsername, inline: true },
+        { name: "🌍 Region", value: player.region, inline: true },
+        { name: "🖥️ Preferred Server", value: player.preferredServer, inline: true },
+        { name: "📊 Previous Tier", value: player.tier, inline: true }
+      )
+      .setFooter({ text: "Apex Tiers — Test Session" })
+      .setTimestamp();
+
+    await ticketChannel.send({
+      content: `<@${player.id}> <@${queue.testerId}>`,
+      embeds: [infoEmbed],
+      components: [buildTicketButtons()],
     });
   } catch (err) {
-    console.error("Failed to create private thread:", err);
+    console.error("Failed to create ticket channel:", err);
     await interaction.followUp({
-      content: `Pulled **${player.displayName}** but could not create a private thread. Check that the bot has the correct permissions.`,
+      content: `Pulled **${player.displayName}** but could not create a ticket channel. Make sure the bot has **Manage Channels** permission.`,
       ephemeral: true,
     });
   }
@@ -539,7 +628,7 @@ async function handlePingQueue(interaction: ButtonInteraction, encodedName: stri
   await interaction.reply({ content: "✅ Pinged all players in the queue.", ephemeral: true });
 }
 
-// Shows the modal — the actual joining happens in handleJoinQueueModal
+// Shows the join modal — actual joining happens in handleJoinQueueModal
 async function handleJoinQueue(interaction: ButtonInteraction, encodedName: string): Promise<void> {
   const queueName = decodeQueueId(encodedName);
   const queue = getQueue(queueName);
@@ -571,24 +660,43 @@ async function handleLeaveQueue(interaction: ButtonInteraction, encodedName: str
   await refreshControlPanel(interaction.client, queueName);
 }
 
-async function handleCloseThread(interaction: ButtonInteraction): Promise<void> {
+async function handleGiveResult(interaction: ButtonInteraction): Promise<void> {
   if (!isStaffMember(interaction.member as GuildMember)) {
-    await interaction.reply({ content: "Only **Verified Testers** can close threads.", ephemeral: true });
+    await interaction.reply({ content: "Only **Verified Testers** can give results.", ephemeral: true });
     return;
   }
 
-  const thread = interaction.channel;
-  if (!thread || !thread.isThread()) {
-    await interaction.reply({ content: "This button can only be used inside a thread.", ephemeral: true });
+  const ticketData = tickets.get(interaction.channelId);
+  if (!ticketData) {
+    await interaction.reply({ content: "Could not find ticket data for this channel.", ephemeral: true });
     return;
   }
 
-  await interaction.reply({ content: "🔒 Test session complete. Thread closed." });
-  await thread.setArchived(true);
+  await interaction.showModal(buildGiveResultModal());
+}
+
+async function handleCloseTicket(interaction: ButtonInteraction): Promise<void> {
+  if (!isStaffMember(interaction.member as GuildMember)) {
+    await interaction.reply({ content: "Only **Verified Testers** can close tickets.", ephemeral: true });
+    return;
+  }
+
+  const channel = interaction.channel as TextChannel;
+  if (!channel) {
+    await interaction.reply({ content: "Could not resolve channel.", ephemeral: true });
+    return;
+  }
+
+  tickets.delete(channel.id);
+
+  await interaction.reply({ content: "🔒 Test session complete. Closing ticket in 5 seconds..." });
+  setTimeout(async () => {
+    try { await channel.delete("Ticket closed by tester"); } catch { }
+  }, 5000);
 }
 
 // ============================================================
-// MODAL SUBMIT HANDLER — Join Queue form
+// MODAL SUBMIT HANDLERS
 // ============================================================
 
 async function handleJoinQueueModal(interaction: ModalSubmitInteraction): Promise<void> {
@@ -623,13 +731,87 @@ async function handleJoinQueueModal(interaction: ModalSubmitInteraction): Promis
   }
 
   await interaction.reply({
-    content: `✅ You've joined the **${queueName}** queue!\n📋 **Your info:** MC: \`${mcUsername}\` · ${region} · ${preferredServer} · ${tier}`,
+    content: `✅ You've joined the **${queueName}** queue! Your details have been saved privately — only your tester will see them.`,
     ephemeral: true,
   });
 
-  // Update both panels from the client since modal submits can't call .update()
   await refreshPlayerPanel(interaction.client, queueName);
   await refreshControlPanel(interaction.client, queueName);
+}
+
+async function handleGiveResultModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const ticketData = tickets.get(interaction.channelId);
+  if (!ticketData) {
+    await interaction.reply({ content: "Could not find ticket data for this channel.", ephemeral: true });
+    return;
+  }
+
+  if (!isStaffMember(interaction.member as GuildMember)) {
+    await interaction.reply({ content: "Only **Verified Testers** can submit results.", ephemeral: true });
+    return;
+  }
+
+  const earnedTier = interaction.fields.getTextInputValue("earned_tier").trim();
+  const gamemode = interaction.fields.getTextInputValue("gamemode").trim();
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const guild = interaction.guild;
+  if (!guild) { await interaction.editReply({ content: "Could not resolve guild." }); return; }
+
+  // Find and assign the tier role to the player
+  let roleAssigned = false;
+  try {
+    const role = guild.roles.cache.find(
+      (r) => r.name.toLowerCase() === earnedTier.toLowerCase()
+    );
+    if (role) {
+      const playerMember = await guild.members.fetch(ticketData.playerId);
+      await playerMember.roles.add(role, `Tier result: ${earnedTier} given by ${ticketData.testerName}`);
+      roleAssigned = true;
+    }
+  } catch (err) {
+    console.error("Failed to assign role:", err);
+  }
+
+  // Post result to #Results channel
+  let postedToResults = false;
+  try {
+    const resultsChannel = guild.channels.cache.find(
+      (ch) => ch.name.toLowerCase() === RESULTS_CHANNEL_NAME && ch.isTextBased()
+    ) as TextChannel | undefined;
+
+    if (resultsChannel) {
+      const resultsEmbed = buildResultsEmbed(ticketData, earnedTier, gamemode);
+      await resultsChannel.send({ embeds: [resultsEmbed] });
+      postedToResults = true;
+    }
+  } catch (err) {
+    console.error("Failed to post to results channel:", err);
+  }
+
+  let reply = `✅ Result submitted!\n**Rank Earned:** ${earnedTier} | **Gamemode:** ${gamemode}`;
+  if (roleAssigned) reply += `\n✅ Role **${earnedTier}** assigned to <@${ticketData.playerId}>`;
+  else reply += `\n⚠️ Could not find a role named **${earnedTier}** — assign it manually.`;
+  if (postedToResults) reply += `\n✅ Result posted to #${RESULTS_CHANNEL_NAME}.`;
+  else reply += `\n⚠️ Could not find a **#${RESULTS_CHANNEL_NAME}** channel — check the channel name.`;
+
+  await interaction.editReply({ content: reply });
+
+  // Also post in the ticket so both see the result
+  const ticketChannel = interaction.channel as TextChannel;
+  if (ticketChannel) {
+    const summaryEmbed = new EmbedBuilder()
+      .setTitle("✅ Test Complete")
+      .setColor(RESULTS_COLOR)
+      .addFields(
+        { name: "Rank Earned", value: earnedTier, inline: true },
+        { name: "Gamemode", value: gamemode, inline: true }
+      )
+      .setFooter({ text: "Result submitted by tester" })
+      .setTimestamp();
+    await ticketChannel.send({ content: `<@${ticketData.playerId}>`, embeds: [summaryEmbed] });
+  }
 }
 
 // ============================================================
@@ -703,6 +885,8 @@ client.on("interactionCreate", async (interaction: Interaction) => {
     try {
       if (interaction.customId.startsWith("join_modal::")) {
         await handleJoinQueueModal(interaction);
+      } else if (interaction.customId === "give_result_modal") {
+        await handleGiveResultModal(interaction);
       }
     } catch (err) {
       console.error("Error handling modal:", err);
@@ -720,13 +904,14 @@ client.on("interactionCreate", async (interaction: Interaction) => {
 
     try {
       switch (action) {
-        case "open_queue":   await handleOpenQueue(interaction, encodedName!); break;
-        case "close_queue":  await handleCloseQueue(interaction, encodedName!); break;
-        case "pull_player":  await handlePullPlayer(interaction, encodedName!); break;
-        case "ping_queue":   await handlePingQueue(interaction, encodedName!); break;
-        case "join_queue":   await handleJoinQueue(interaction, encodedName!); break;
-        case "leave_queue":  await handleLeaveQueue(interaction, encodedName!); break;
-        case "close_thread": await handleCloseThread(interaction); break;
+        case "open_queue":    await handleOpenQueue(interaction, encodedName!); break;
+        case "close_queue":   await handleCloseQueue(interaction, encodedName!); break;
+        case "pull_player":   await handlePullPlayer(interaction, encodedName!); break;
+        case "ping_queue":    await handlePingQueue(interaction, encodedName!); break;
+        case "join_queue":    await handleJoinQueue(interaction, encodedName!); break;
+        case "leave_queue":   await handleLeaveQueue(interaction, encodedName!); break;
+        case "give_result":   await handleGiveResult(interaction); break;
+        case "close_ticket":  await handleCloseTicket(interaction); break;
       }
     } catch (err) {
       console.error(`Error handling button [${interaction.customId}]:`, err);
