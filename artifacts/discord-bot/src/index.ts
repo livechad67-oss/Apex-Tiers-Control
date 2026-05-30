@@ -34,7 +34,7 @@ import {
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const VERIFIED_TESTER_ROLE_NAME = "Verified Tester";
-const RESULTS_CHANNEL_NAME = "results";
+const RESULTS_CHANNEL_NAME = "🏆・results";
 
 if (!TOKEN) {
   console.error("DISCORD_TOKEN environment variable is required.");
